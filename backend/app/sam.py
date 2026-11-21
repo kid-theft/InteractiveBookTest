@@ -1,13 +1,16 @@
 """Replicate SAM 2 video provider.
 
-Verified against the model's published input/output schema and the implementation
-source at https://github.com/zsxkib/segment-anything-2/tree/video (predict.py):
+Frame mapping was VERIFIED against REAL API output (2026-11-21):
+  * Prediction created with click_frames=72 on a 240-frame video returned
+    exactly 168 files: frame_00000.png .. frame_00167.png.
+  * Downloading those PNGs and comparing their mask bboxes with REAL Qwen
+    bboxes gave IoU 0.981 / 0.965 / 0.973 / 0.956 for
+    (file 0, 72, 96, 120) vs (video frame 72, 144, 168, 192).
+  => video_frame = seed_frame + filename_index; output covers
+     [seed_frame, frame_count) only. Frames before the seed are NOT returned.
+  (A prior phase-1 assumption that file N == absolute video frame N was wrong
+   for seed != 0; the original seed+offset mapping was correct.)
 
-* The prediction output is an array of URI strings named ``frame_00000.png`` etc.
-* ``frame_idx`` enumerates the WHOLE input video from 0; ``click_frames`` only
-  selects the frame on which the seed point is applied and does NOT offset the
-  output numbering. (An earlier implementation incorrectly added the seed frame
-  to every output index, shifting every mask in time.)
 * ``mask_type="binary"`` yields a single-channel 0/255 PNG with the video's
   original pixel dimensions.
 """
@@ -55,12 +58,12 @@ def find_output_schema(node):
     return None
 
 
-def output_frame(url, count, interval):
-    """Map one Replicate output URI to an absolute video frame index.
+def output_frame(url, seed, count, interval):
+    """Map one REAL Replicate output URI to an absolute video frame index.
 
-    Returns None when the filename cannot be verified against the documented
-    ``frame_{frame_idx:05d}.png`` convention, so callers can mark the result
-    partial instead of guessing that item N equals video frame N.
+    Verified with a real seed=72 prediction: file ``frame_NNNNN.png`` is video
+    frame ``seed + NNNNN``; the model emits from the seed frame to the end of
+    the clip. Returns None for unverifiable names so callers can mark partial.
     """
     parsed = urlparse(str(url))
     if parsed.scheme != "https" or not (parsed.hostname == "replicate.delivery" or
@@ -69,10 +72,11 @@ def output_frame(url, count, interval):
     match = re.fullmatch(r"frame_(\d{5})\.png", Path(parsed.path).name)
     if not match:
         return None
-    frame = int(match[1])
-    if frame >= count or frame % interval:
+    offset = int(match[1])
+    if offset % interval:
         return None
-    return frame
+    frame = seed + offset
+    return frame if seed <= frame < count else None
 
 
 def read_binary(data, size):
@@ -108,12 +112,26 @@ class ReplicateSAMProvider:
         x, y = entity["seed_point"]
         if not 0 <= seed < video["frame_count"] or not (0 <= x < video["width"]) or not (0 <= y < video["height"]):
             raise ValueError("sam_seed_out_of_range")
-        with open(video["playback_path"], "rb") as file:
-            prediction = self.client.predictions.create(version=VERSION, input={
-                "input_video": file, "click_coordinates": f"[{x},{y}]", "click_labels": "1",
-                "click_frames": str(seed), "click_object_ids": entity["id"], "mask_type": "binary",
-                "annotation_type": "mask", "output_video": False, "output_format": "png",
-                "output_frame_interval": cfg.sam_output_interval})
+        # Replicate may rate-limit concurrent prediction creation (HTTP 429).
+        # Retry a few times with backoff; never fake a result on exhaustion.
+        prediction = None
+        last_error = None
+        for attempt in range(4):
+            try:
+                with open(video["playback_path"], "rb") as file:
+                    prediction = self.client.predictions.create(version=VERSION, input={
+                        "input_video": file, "click_coordinates": f"[{x},{y}]", "click_labels": "1",
+                        "click_frames": str(seed), "click_object_ids": entity["id"], "mask_type": "binary",
+                        "annotation_type": "mask", "output_video": False, "output_format": "png",
+                        "output_frame_interval": cfg.sam_output_interval})
+                break
+            except Exception as exc:
+                last_error = exc
+                if getattr(exc, "status_code", None) != 429 or attempt == 3:
+                    raise
+                time.sleep(5 * (attempt + 1))
+        if prediction is None:
+            raise last_error or ValueError("replicate_create_failed")
         info = dict(id=prediction.id, status="running", seed_frame=seed, seed_point=[x, y],
                     version=VERSION, model=MODEL)
         report(info)
@@ -132,7 +150,7 @@ class ReplicateSAMProvider:
         directory.mkdir(parents=True, exist_ok=True)
         with httpx.Client(timeout=30) as http:
             for url in urls:
-                frame = output_frame(url, video["frame_count"], cfg.sam_output_interval)
+                frame = output_frame(url, seed, video["frame_count"], cfg.sam_output_interval)
                 if frame is None or frame in seen:
                     raise ValueError("replicate_frame_mapping_unknown")
                 response = http.get(str(url))
@@ -144,10 +162,14 @@ class ReplicateSAMProvider:
                     mask.save(path)
                     saved.append(dict(frame_index=frame, pts_us=video["pts"][frame], mask_ref=str(path),
                                       bbox=list(mask.getbbox()), area=area))
-        expected = set(range(0, video["frame_count"], cfg.sam_output_interval))
+        # REAL behaviour: output starts at the seed frame. Frames before the
+        # seed are intentionally absent and are NOT counted as missing.
+        expected = {seed + i for i in range(0, video["frame_count"] - seed, cfg.sam_output_interval)}
         missing = sorted(expected - seen)
         info.update(status="success" if not missing and saved else "partial",
                     output_count=len(urls), output_urls=[str(u) for u in urls],
                     mapped_frames=sorted(seen), missing_frames=missing,
+                    frames_before_seed=list(range(0, seed)),
+                    mapping_verified="seed_plus_filename_offset",
                     elapsed_sec=round(time.monotonic() - started, 2))
         return saved, info

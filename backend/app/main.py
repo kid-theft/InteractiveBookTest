@@ -1,3 +1,4 @@
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,19 @@ from .qwen import QwenVLMProvider
 @asynccontextmanager
 async def lifespan(app):
     db.meta.create_all(db.engine)
+    # Seed the content-hash index from videos that already have a complete index.
+    index = load_hash_index()
+    for row in db.rows(select(db.videos)):
+        p = Path(row["video_path"])
+        ix = db.get(db.indices, f"{row['id']}-{row['version']}")
+        if p.exists() and ix and ix["status"] == "success":
+            try:
+                h = hashlib.sha256(p.read_bytes()).hexdigest()
+                index.setdefault(h, row["id"])
+            except OSError:
+                pass
+    if index:
+        save_hash_index(index)
     with db.engine.begin() as con:
         con.execute(db.tasks.update().where(db.tasks.c.stage.not_in(["completed","partial","failed"])).values(
                     stage="failed",error="服务重启，请重试"))
@@ -48,6 +62,21 @@ def health():
     return {"status":"ok","qwen_configured":bool(cfg.dashscope_api_key),"replicate_configured":bool(cfg.replicate_api_token)}
 
 
+HASH_INDEX = cfg.video_storage_dir / "content_index.json"
+
+
+def load_hash_index():
+    try:
+        return json.loads(HASH_INDEX.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_hash_index(index):
+    HASH_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    HASH_INDEX.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+
+
 @api.post("/videos",status_code=202)
 def upload(background: BackgroundTasks,file: Annotated[UploadFile,File()]):
     name = Path(file.filename or "").name
@@ -58,6 +87,7 @@ def upload(background: BackgroundTasks,file: Annotated[UploadFile,File()]):
     directory = cfg.video_storage_dir / "videos" / vid
     directory.mkdir(parents=True)
     original = directory / ("original"+ext)
+    digest = hashlib.sha256()
     try:
         size = 0
         with original.open("wb") as out:
@@ -65,18 +95,33 @@ def upload(background: BackgroundTasks,file: Annotated[UploadFile,File()]):
                 size += len(chunk)
                 if size > cfg.video_max_size_mb*1024*1024:
                     raise HTTPException(413,"文件过大")
+                digest.update(chunk)
                 out.write(chunk)
+        content_hash = digest.hexdigest()
+        # Content-addressed reuse: a previously fully-analyzed identical video
+        # needs no FFmpeg, no Qwen and no Replicate call at all.
+        index = load_hash_index()
+        cached = index.get(content_hash)
+        if cached:
+            v = db.get(db.videos, cached)
+            ix = db.get(db.indices, f"{cached}-{v['version']}") if v else None
+            if v and ix and ix["status"] == "success":
+                shutil.rmtree(directory)
+                return {"video_id":cached,"task_id":None,"cached":True,
+                        "message":"命中相同视频的已完成索引，跳过全部 AI 调用"}
         inspect_video(original)
         with db.engine.begin() as con:
             con.execute(db.videos.insert().values(id=vid,name=name,video_path=str(original),version=0,status="uploaded"))
             con.execute(db.tasks.insert().values(id=task,video_id=vid,stage="uploaded",progress=0,error=""))
+        index[content_hash] = vid
+        save_hash_index(index)
     except Exception as exc:
         shutil.rmtree(directory)
         if isinstance(exc,HTTPException):
             raise
         raise HTTPException(422,"视频内容、分辨率或时长不受支持") from exc
     background.add_task(prepare,vid,task)
-    return {"video_id":vid,"task_id":task}
+    return {"video_id":vid,"task_id":task,"cached":False}
 
 
 @api.get("/videos")
@@ -119,30 +164,32 @@ class Seed(BaseModel):
     y:int=Field(ge=0)
 
 
-def begin(vid,background,segment_only,seed=None):
+def begin(vid,background,segment_only,seed=None,entity_id=None):
     v=require(db.videos,vid)
     if not v["playback_path"]:
         raise HTTPException(409,"等待视频预处理")
     if not cfg.replicate_api_token or (not segment_only and not cfg.dashscope_api_key):
         raise HTTPException(503,"请在后端 .env 配置所需的百炼和 Replicate 密钥，并重建 API 容器")
-    # A fresh analysis creates a new index version; re-segmentation reuses the
-    # current version and its existing entities/index row.
-    version=v["version"]+int(not segment_only)
-    index_id=f"{vid}-{version}"
-    task=db.uid()
+    # Re-analysis of a video with a complete index reuses the SAME version:
+    # entities, observations and masks are all still valid, so no AI call is needed.
+    existing = db.get(db.indices, f"{vid}-{v['version']}")
+    reuse_version = bool(existing and existing["status"] == "success")
+    version = v["version"] if (segment_only or reuse_version) else v["version"] + 1
+    index_id = f"{vid}-{version}"
+    task = db.uid()
     with db.engine.begin() as con:
-        claim=con.execute(db.videos.update().where(db.videos.c.id==vid,db.videos.c.status=="playable",
-                          db.videos.c.version==v["version"]).values(status="indexing",version=version))
+        claim = con.execute(db.videos.update().where(db.videos.c.id==vid,db.videos.c.status=="playable",
+                            db.videos.c.version==v["version"]).values(status="indexing",version=version))
         if not claim.rowcount:
             raise HTTPException(409,"任务正在运行")
-        if segment_only:
+        if segment_only or reuse_version:
             if not con.execute(select(db.entities.c.id).where(db.entities.c.video_id==vid,db.entities.c.version==version)).first():
                 raise HTTPException(409,"请先分析视频")
             con.execute(db.indices.update().where(db.indices.c.id==index_id).values(status="running"))
             if seed:
                 if seed.frame_index>=v["frame_count"] or seed.x>=v["width"] or seed.y>=v["height"]:
                     raise HTTPException(422,"种子点超出画面")
-                changed=con.execute(db.entities.update().where(db.entities.c.id==seed.entity_id,
+                changed = con.execute(db.entities.update().where(db.entities.c.id==seed.entity_id,
                     db.entities.c.version==version,db.entities.c.video_id==vid).values(seed_frame=seed.frame_index,seed_point=[seed.x,seed.y]))
                 if not changed.rowcount:
                     raise HTTPException(404,"对象不存在")
@@ -150,8 +197,10 @@ def begin(vid,background,segment_only,seed=None):
             con.execute(db.indices.insert().values(id=index_id,video_id=vid,version=version,status="pending"))
         con.execute(db.tasks.insert().values(id=task,video_id=vid,stage="uploaded",progress=0,error=""))
     db.update(db.indices,index_id,status="running")
-    background.add_task(analyze,vid,task,index_id,segment_only)
-    return {"task_id":task}
+    # On the reuse path skip observe() entirely; analyze() also skips every
+    # object whose real SAM prediction already succeeded.
+    background.add_task(analyze,vid,task,index_id,segment_only or reuse_version,entity_id)
+    return {"task_id":task,"version":version,"reused":reuse_version or segment_only}
 
 
 @api.post("/videos/{vid}/analyze",status_code=202)
@@ -159,9 +208,15 @@ def start_analysis(vid:str,background:BackgroundTasks):
     return begin(vid,background,False)
 
 
+class SegmentRequest(BaseModel):
+    entity_id: str | None = None   # resume only this object
+    seed: Seed | None = None       # optional corrected seed point
+
+
 @api.post("/videos/{vid}/segment",status_code=202)
-def start_segmentation(vid:str,background:BackgroundTasks,seed:Seed|None=None):
-    return begin(vid,background,True,seed)
+def start_segmentation(vid:str,background:BackgroundTasks,body:SegmentRequest|None=None):
+    body = body or SegmentRequest()
+    return begin(vid,background,True,body.seed,body.entity_id)
 
 
 @api.get("/videos/{vid}/entities")
@@ -177,8 +232,12 @@ def index(vid:str,timestamp_sec:float|None=None):
     if timestamp_sec is not None and v["pts"]:
         frame=displayed_frame(v["pts"],timestamp_sec,v["duration"])
         result["frame_index"]=frame
-        result["masks"]=db.rows(select(db.masks.c.track_id,db.masks.c.area,db.masks.c.pts_us).where(
+        rows=db.rows(select(db.masks.c.track_id,db.masks.c.area,db.masks.c.pts_us,db.masks.c.bbox).where(
                            db.masks.c.video_id==vid,db.masks.c.video_version==v["version"],db.masks.c.frame_index==frame)) if frame is not None else []
+        # Additive field for the browser overlay: a stable URL per mask on this frame.
+        for row in rows:
+            row["mask_url"]=f"/api/v1/videos/{vid}/masks/{row['track_id']}/{frame}"
+        result["masks"]=rows
     return result
 
 

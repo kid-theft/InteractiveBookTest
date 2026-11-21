@@ -52,11 +52,12 @@ class FakeClient:
 
     def create(self, version, input):
         assert version == sam.VERSION
-        assert input["click_frames"] == "12"        # seed frame is a prompt, not an offset
+        assert input["click_frames"] == "12"
         assert input["click_coordinates"] == "[30,40]"
         assert input["mask_type"] == "binary" and input["output_format"] == "png"
         assert input["output_frame_interval"] == 1
-        return FakePrediction(range(0, 48), 48)
+        # REAL behaviour: output starts at the seed frame and goes to the end.
+        return FakePrediction(range(0, 48 - 12), 48)
 
 
 class FakeHTTP:
@@ -97,22 +98,24 @@ def test_segment_maps_frame_zero_to_video_frame_zero_and_reports_partial(patched
     reports = []
     saved, info = provider.segment(video, entity, patched / "masks", reports.append)
 
-    # frame_00000.png must be frame 0, not seed(12)+0.
-    assert saved[0]["frame_index"] == 0
-    assert saved[0]["pts_us"] == video["pts"][0]
-    assert [m["frame_index"] for m in saved] == list(range(0, 48, 2))
+    # REAL mapping: file 0 -> video frame 12 (the seed), not frame 0.
+    assert saved[0]["frame_index"] == 12
+    assert saved[0]["pts_us"] == video["pts"][12]
+    assert [m["frame_index"] for m in saved] == list(range(12, 48, 2))
     assert all(Path(m["mask_ref"]).exists() for m in saved)
-    assert info["output_count"] == 48
-    assert info["mapped_frames"] == list(range(48))
+    assert info["output_count"] == 36
+    assert info["mapped_frames"] == list(range(12, 48))
     assert info["missing_frames"] == []
-    assert info["status"] == "success"       # all frames mapped; empty masks are legal
+    assert info["frames_before_seed"] == list(range(0, 12))
+    assert info["mapping_verified"] == "seed_plus_filename_offset"
+    assert info["status"] == "success"
     assert reports[0]["seed_frame"] == 12
 
 
 def test_segment_marks_partial_when_frames_are_missing(monkeypatch, patched):
     class PartialClient(FakeClient):
         def create(self, version, input):
-            return FakePrediction(range(0, 40), 48)
+            return FakePrediction(range(0, 28), 48)   # 12..39 only, missing 40..47
 
     monkeypatch.setattr(sam.replicate, "Client", PartialClient)
     provider = sam.ReplicateSAMProvider()
@@ -122,4 +125,4 @@ def test_segment_marks_partial_when_frames_are_missing(monkeypatch, patched):
     saved, info = provider.segment(video, entity, patched / "masks2", lambda _: None)
     assert info["status"] == "partial"
     assert info["missing_frames"] == list(range(40, 48))
-    assert len(saved) == 20
+    assert len(saved) == 14

@@ -18,7 +18,9 @@ class Settings(BaseSettings):
     video_sample_interval: float = Field(1, ge=0.25, le=10)
     video_canonical_fps: int = Field(24, ge=1, le=60)
     sam_max_objects: int = Field(3, ge=1, le=3)
-    sam_concurrency: int = Field(2, ge=1, le=3)
+    sam_concurrency: int = Field(1, ge=1, le=3)  # Replicate 429s on concurrent creates
+    qwen_concurrency: int = Field(4, ge=1, le=8)  # keyframe VLM calls are independent
+    qwen_max_keyframes: int = Field(0, ge=0, le=60)  # 0 = all keyframes
     sam_output_interval: int = Field(1, ge=1, le=60)
 
 

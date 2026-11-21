@@ -66,11 +66,19 @@ export type TouchResult = {
   match_score: number
 }
 
+export type FrameMask = {
+  track_id: string
+  area: number
+  pts_us: number
+  bbox: number[] | null
+  mask_url: string
+}
+
 export type IndexStatus = {
   status: string
   version: number
   frame_index?: number | null
-  masks?: { track_id: string; area: number; pts_us: number }[]
+  masks?: FrameMask[]
 }
 
 export const api = {
@@ -79,7 +87,7 @@ export const api = {
   upload: async (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    const { data } = await http.post<{ video_id: string; task_id: string }>('/videos', form)
+    const { data } = await http.post<{ video_id: string; task_id: string | null; cached?: boolean; message?: string }>('/videos', form)
     return data
   },
 
@@ -94,8 +102,9 @@ export const api = {
 
   analyze: async (id: string) => (await http.post<{ task_id: string }>(`/videos/${id}/analyze`)).data,
 
-  segment: async (id: string, seed?: { entity_id: string; frame_index: number; x: number; y: number }) =>
-    (await http.post<{ task_id: string }>(`/videos/${id}/segment`, seed ?? null)).data,
+  segment: async (id: string, entityId?: string, seed?: { entity_id: string; frame_index: number; x: number; y: number }) =>
+    (await http.post<{ task_id: string; version: number; reused: boolean }>(
+      `/videos/${id}/segment`, entityId ? { entity_id: entityId, seed } : null)).data,
 
   entities: async (id: string) => (await http.get<Entity[]>(`/videos/${id}/entities`)).data,
 

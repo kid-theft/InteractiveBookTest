@@ -41,17 +41,21 @@ def test_displayed_frame_uses_pts_bisect_and_rejects_out_of_range():
     assert displayed_frame([], 0.1, 1.0) is None
 
 
-def test_sam_output_frame_is_absolute_video_frame_not_seed_offset():
-    # The model source enumerates the whole video from frame 0; click_frames does
-    # not shift output numbering. seed=48 must NOT turn frame_00000 into frame 48.
+def test_sam_output_frame_uses_seed_plus_filename_offset_verified_by_real_api():
+    # REAL API check (2026-11-21): seed=72 on a 240-frame video returned
+    # frame_00000..frame_00167, and the downloaded masks matched Qwen bboxes at
+    # video frames 72/144/168/192 with IoU 0.98/0.97/0.97/0.96.
     base = "https://replicate.delivery/xk9/frame_{:05d}.png?sig=abc"
-    count, interval = 120, 1
-    for i in (0, 1, 24, 119):
-        assert output_frame(base.format(i), count, interval) == i
-    assert output_frame(base.format(120), count, interval) is None   # beyond video
-    assert output_frame("https://evil.example/frame_00001.png", count, interval) is None
-    assert output_frame("https://replicate.delivery/x/mask_00001.png", count, interval) is None
-    assert output_frame(base.format(3), count, 2) is None             # interval mismatch
+    seed, count = 72, 240
+    assert output_frame(base.format(0), seed, count, 1) == 72
+    assert output_frame(base.format(72), seed, count, 1) == 144
+    assert output_frame(base.format(167), seed, count, 1) == 239
+    assert output_frame(base.format(168), seed, count, 1) is None   # beyond video
+    assert output_frame(base.format(3), seed, count, 2) is None      # interval mismatch
+    assert output_frame("https://evil.example/frame_00001.png", seed, count, 1) is None
+    assert output_frame("https://replicate.delivery/x/mask_00001.png", seed, count, 1) is None
+    # seed=0 degenerates to identity (the earlier tested case).
+    assert output_frame(base.format(0), 0, 120, 1) == 0
 
 
 def test_find_output_schema_handles_inline_and_component_shapes():

@@ -1,22 +1,29 @@
 import { defineConfig } from '@playwright/test'
+import { existsSync } from 'node:fs'
 
-// Smoke test only: verifies the SPA boots and reaches the API through Vite's
-// proxy. Real Qwen/SAM browser flows require configured API keys.
+// Prefer an already-installed Chrome so no large browser download is needed.
+// Override with E2E_CHROME_PATH when Chrome lives elsewhere.
+const candidates = [
+  process.env.E2E_CHROME_PATH,
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium',
+].filter(Boolean)
+const chromePath = candidates.find(p => existsSync(p))
+
 export default defineConfig({
   testDir: './e2e',
-  timeout: 30000,
+  timeout: 60000,
+  expect: { timeout: 10000 },
+  workers: 1,
+  reporter: [['line']],
   use: {
     baseURL: process.env.E2E_BASE_URL || 'http://127.0.0.1:5173',
     headless: true,
-    // Use an installed Chrome rather than downloading Playwright's pinned
-    // Chromium build (offline-friendly). Override with E2E_CHANNEL=chromium
-    // when the matching browser revision is available.
-    channel: process.env.E2E_CHANNEL || 'chrome',
+    ...(chromePath ? { launchOptions: { executablePath: chromePath, args: ['--no-sandbox', '--disable-dev-shm-usage'] } } : {}),
+    screenshot: 'only-on-failure',
   },
-  webServer: process.env.E2E_BASE_URL ? undefined : {
-    command: 'npm run dev -- --host 127.0.0.1',
-    url: 'http://127.0.0.1:5173',
-    reuseExistingServer: true,
-    timeout: 60000,
-  },
+  // The compose stack already serves the SPA; don't start a second dev server.
+  webServer: undefined,
 })

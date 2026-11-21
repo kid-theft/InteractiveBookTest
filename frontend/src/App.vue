@@ -5,6 +5,8 @@ import {
   type Entity, type IndexStatus, type Task, type TouchResult, type VideoDetails,
 } from './api'
 import { contentRect, mapClientPoint, type Rect } from './geometry'
+import MaskOverlay from './MaskOverlay.vue'
+import { entityColor } from './entityColors'
 
 type ChatMessage = { role: 'user' | 'assistant'; text: string; evidence?: number[] }
 type LibraryItem = { id: string; name: string; status: string }
@@ -30,8 +32,12 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const videoEl = ref<FrameCallbackVideo | null>(null)
 const stageEl = ref<HTMLDivElement | null>(null)
 const overlay = ref<HTMLCanvasElement | null>(null)
+const maskCanvas = ref<HTMLCanvasElement | null>(null)
+const maskOverlayRef = ref<InstanceType<typeof MaskOverlay> | null>(null)
 
 const mediaTime = ref(0)
+const currentFrame = ref(0)
+const overlayStats = ref<{ frame: number; loaded: number; cacheSize: number; loadMs: number | null } | null>(null)
 const displayRect = ref<Rect>({ left: 0, top: 0, width: 0, height: 0 })
 const showMasks = ref(true)
 const maskVersion = ref(0)
@@ -117,8 +123,13 @@ async function onUpload(event: Event) {
   notice.value = ''
   try {
     const created = await api.upload(file)
-    notice.value = '上传成功，正在标准化视频…'
     await refreshLibrary()
+    if (created.cached || !created.task_id) {
+      notice.value = created.message || '命中已完成索引，跳过全部 AI 调用。'
+      await loadVideo(created.video_id, false)
+      return
+    }
+    notice.value = '上传成功，正在标准化视频…'
     await waitForTask(created.task_id, '预处理')
     await loadVideo(created.video_id, true)
     notice.value = '视频已就绪，可以开始分析。'
@@ -152,6 +163,7 @@ async function startAnalysis() {
     notice.value = '已启动 Qwen 识别 + SAM 2 分割…'
     const finished = await waitForTask(created.task_id, '分析')
     await Promise.all([refreshEntities(), refreshIndex(), api.details(videoId.value).then(d => details.value = d)])
+    maskVersion.value++
     notice.value = finished.stage === 'completed'
       ? '分析完成：播放视频并点击画面中的对象。'
       : `分析${taskLabel(finished.stage)}，请查看对象分割详情。`
@@ -162,7 +174,7 @@ async function resegment(entity: Entity) {
   if (!videoId.value || !details.value) return
   try {
     const frame = indexStatus.value?.frame_index ?? entity.seed_frame ?? 0
-    const created = await api.segment(videoId.value, {
+    const created = await api.segment(videoId.value, entity.id, {
       entity_id: entity.id,
       frame_index: frame,
       x: entity.seed_point[0],
@@ -191,15 +203,25 @@ function measure() {
   if (!stage || !video || !details.value) return
   const bounds = stage.getBoundingClientRect()
   displayRect.value = contentRect(bounds.width, bounds.height, details.value.width, details.value.height)
-  const canvas = overlay.value
-  if (canvas) {
-    const dpr = window.devicePixelRatio || 1
+  const dpr = window.devicePixelRatio || 1
+  for (const canvas of [overlay.value, maskCanvas.value]) {
+    if (!canvas) continue
     canvas.width = Math.round(bounds.width * dpr)
     canvas.height = Math.round(bounds.height * dpr)
     canvas.style.width = `${bounds.width}px`
     canvas.style.height = `${bounds.height}px`
   }
   drawOverlay()
+  maskOverlayRef.value?.redraw()
+}
+
+function onOverlayFrame(frame: number, t: number) {
+  currentFrame.value = frame
+  mediaTime.value = t
+}
+
+function onOverlayStats(s: { frame: number; loaded: number; cacheSize: number; loadMs: number | null }) {
+  overlayStats.value = s
 }
 
 function drawOverlay() {
@@ -264,6 +286,7 @@ async function onStageClick(event: MouseEvent) {
       const entity = entities.value.find(e => e.id === result.selected_entity!.entity_id) || null
       selectEntity(entity)
     } else if (result.status === 'no_hit') {
+      selectEntity(null)
       notice.value = `空白区域：未命中任何对象（第 ${result.frame_index} 帧）。`
     } else {
       notice.value = `命中 ${result.candidates.length} 个候选对象，请在右侧选择。`
@@ -393,7 +416,7 @@ onBeforeUnmount(() => {
         <div class="card player-card">
           <div class="player-head">
             <h2>交互播放器</h2>
-            <label class="toggle"><input type="checkbox" v-model="showMasks" /> 显示区域框</label>
+            <label class="toggle"><input type="checkbox" v-model="showMasks" /> 显示 SAM Mask</label>
           </div>
           <div v-if="!videoId" class="placeholder">
             <p>请从左侧上传或选择视频</p>
@@ -401,8 +424,18 @@ onBeforeUnmount(() => {
           <div v-else ref="stageEl" class="stage" @click="onStageClick">
             <video ref="videoEl" :src="api.playbackUrl(videoId)" controls playsinline preload="metadata"
                    @loadedmetadata="measure" @seeked="measure" />
+            <canvas ref="maskCanvas" class="overlay mask-layer" />
             <canvas ref="overlay" class="overlay" />
+            <MaskOverlay v-if="details" ref="maskOverlayRef"
+              :video-id="videoId" :details="details" :entities="entities"
+              :video-el="videoEl" :canvas-el="maskCanvas" :rect="displayRect"
+              :selected-entity-id="selected?.id ?? null" :enabled="showMasks"
+              :refresh-token="maskVersion" @frame="onOverlayFrame" @stats="onOverlayStats" />
           </div>
+          <p v-if="overlayStats" class="hint mask-stats">
+            Mask 叠加：帧 {{ overlayStats.frame }} · 已加载 {{ overlayStats.loaded }} 张 ·
+            缓存 {{ overlayStats.cacheSize }} 张 · 单张加载 {{ overlayStats.loadMs ?? '—' }} ms
+          </p>
           <p v-if="notice" class="notice">{{ notice }}</p>
           <p v-if="error" class="err-banner">{{ error }}</p>
           <div v-if="touchResult" class="touch-result" :data-status="touchResult.status">
@@ -427,7 +460,10 @@ onBeforeUnmount(() => {
           <ul class="entities">
             <li v-for="e in entities" :key="e.id" :class="{ active: selected?.id === e.id }"
                 @click="selectEntity(e)">
-              <div class="entity-title"><strong>{{ e.label }}</strong><small>{{ e.category }}</small></div>
+              <div class="entity-title">
+                <span class="color-dot" :style="{ background: entityColor(e.id) }" />
+                <strong>{{ e.label }}</strong><small>{{ e.category }}</small>
+              </div>
               <p>{{ e.description }}</p>
               <p class="attr" v-if="e.attributes && Object.keys(e.attributes).length">
                 {{ Object.entries(e.attributes).map(([k, v]) => `${k}: ${v}`).join(' · ') }}
