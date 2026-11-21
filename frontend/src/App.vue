@@ -99,7 +99,11 @@ async function loadVideo(id: string, autoAnalyze = false) {
     details.value = await api.details(id)
     await Promise.all([refreshEntities(), refreshIndex()])
     await nextTick()
+    observeStage()
     setupFrameCallback()
+    // Layout can settle after stats/notice lines appear; re-measure shortly after.
+    requestAnimationFrame(() => measure())
+    setTimeout(() => measure(), 250)
     if (autoAnalyze && canAnalyze.value) await startAnalysis()
   } catch (err) { setError(err) }
 }
@@ -208,11 +212,22 @@ function measure() {
     if (!canvas) continue
     canvas.width = Math.round(bounds.width * dpr)
     canvas.height = Math.round(bounds.height * dpr)
-    canvas.style.width = `${bounds.width}px`
-    canvas.style.height = `${bounds.height}px`
+    // Size is governed by CSS (position:absolute; inset:0). Writing explicit
+    // style width/height here froze a stale size and shifted the mask layer.
+    canvas.style.width = ''
+    canvas.style.height = ''
   }
   drawOverlay()
   maskOverlayRef.value?.redraw()
+}
+
+function observeStage() {
+  // stageEl only exists after a video is selected (v-if), so it cannot be
+  // observed in onMounted; (re)bind whenever the stage element appears.
+  resizeObserver?.disconnect()
+  resizeObserver = new ResizeObserver(() => measure())
+  if (stageEl.value) resizeObserver.observe(stageEl.value)
+  measure()
 }
 
 function onOverlayFrame(frame: number, t: number) {
@@ -334,10 +349,8 @@ watch([showMasks, maskVersion, indexStatus], () => drawOverlay())
 
 onMounted(async () => {
   await Promise.all([refreshHealth(), refreshLibrary()])
-  resizeObserver = new ResizeObserver(() => measure())
-  if (stageEl.value) resizeObserver.observe(stageEl.value)
   window.addEventListener('resize', measure)
-  measure()
+  observeStage()
 })
 
 onBeforeUnmount(() => {
