@@ -152,10 +152,25 @@ function draw() {
   if (!canvas) return
   const ctx = canvas.getContext('2d')
   if (!ctx) return
-  const dpr = window.devicePixelRatio || 1
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  const bounds = canvas.getBoundingClientRect()
-  ctx.clearRect(0, 0, bounds.width, bounds.height)
+  // If the canvas has not been sized to its CSS box yet, drawing would scale the
+  // mask against the default 300x150 buffer and look shifted. Skip until ready.
+  const cssBox = canvas.getBoundingClientRect()
+  if (!cssBox.width || !cssBox.height) return
+  // Self-heal the backing buffer: it must match the CSS box at the current DPR,
+  // otherwise the mask is drawn into a stale 300x150 buffer and appears shifted.
+  const wantW = Math.round(cssBox.width * (window.devicePixelRatio || 1))
+  const wantH = Math.round(cssBox.height * (window.devicePixelRatio || 1))
+  if (canvas.width !== wantW || canvas.height !== wantH) {
+    canvas.width = wantW
+    canvas.height = wantH
+  }
+  // Map the drawing surface to the canvas' actual CSS box (not the stage box):
+  // the canvas element can differ from the stage by a sub-pixel, and using the
+  // wrong reference shifts/scales the whole mask layer.
+  const sx = canvas.width / cssBox.width
+  const sy = canvas.height / cssBox.height
+  ctx.setTransform(sx, 0, 0, sy, 0, 0)
+  ctx.clearRect(0, 0, cssBox.width, cssBox.height)
   const r = props.rect
   if (!r.width || !props.enabled) return
   const rows = frameMasks.get(lastFrame) ?? []
@@ -301,6 +316,9 @@ onMounted(() => {
   attach()
   resizeObserver = new ResizeObserver(() => draw())
   if (props.canvasEl) resizeObserver.observe(props.canvasEl)
+  // Draw once layout is stable (the canvas may still be at its default size).
+  requestAnimationFrame(() => draw())
+  setTimeout(() => draw(), 120)
   fullscreenHandler = () => setTimeout(() => draw(), 60)
   document.addEventListener('fullscreenchange', fullscreenHandler)
   syncFromVideo()

@@ -201,24 +201,35 @@ function setupFrameCallback() {
   frameHandle = video.requestVideoFrameCallback(cb)
 }
 
+let measureAttempts = 0
+
 function measure() {
   const stage = stageEl.value
   const video = videoEl.value
   if (!stage || !video || !details.value) return
   const bounds = stage.getBoundingClientRect()
-  displayRect.value = contentRect(bounds.width, bounds.height, details.value.width, details.value.height)
   const dpr = window.devicePixelRatio || 1
+  let sized = 0
   for (const canvas of [overlay.value, maskCanvas.value]) {
     if (!canvas) continue
-    canvas.width = Math.round(bounds.width * dpr)
-    canvas.height = Math.round(bounds.height * dpr)
-    // Size is governed by CSS (position:absolute; inset:0). Writing explicit
-    // style width/height here froze a stale size and shifted the mask layer.
     canvas.style.width = ''
     canvas.style.height = ''
+    const cb = canvas.getBoundingClientRect()
+    if (!cb.width || !cb.height) continue   // not laid out yet; keep default and retry
+    canvas.width = Math.round(cb.width * dpr)
+    canvas.height = Math.round(cb.height * dpr)
+    sized++
   }
+  // Content rect must be expressed in the same CSS box the canvases occupy.
+  const ref = maskCanvas.value?.getBoundingClientRect() ?? bounds
+  displayRect.value = contentRect(ref.width, ref.height, details.value.width, details.value.height)
   drawOverlay()
   maskOverlayRef.value?.redraw()
+  // If a canvas was not laid out yet, retry on the next frames (bounded).
+  if ((sized < 2 || !ref.width) && measureAttempts < 12) {
+    measureAttempts++
+    requestAnimationFrame(measure)
+  }
 }
 
 function observeStage() {
@@ -244,9 +255,10 @@ function drawOverlay() {
   if (!canvas) return
   const ctx = canvas.getContext('2d')
   if (!ctx) return
-  const dpr = window.devicePixelRatio || 1
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  const { width, height } = canvas.getBoundingClientRect()
+  const box = canvas.getBoundingClientRect()
+  ctx.setTransform(canvas.width / (box.width || 1), 0, 0, canvas.height / (box.height || 1), 0, 0)
+  const width = box.width
+  const height = box.height
   ctx.clearRect(0, 0, width, height)
   const rect = displayRect.value
   if (!rect.width) return
