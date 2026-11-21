@@ -1,0 +1,30 @@
+name: interactivebook-lab
+services:
+  api:
+    build: ./backend
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    volumes:
+      - storage:/app/storage
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  web:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${WEB_HOST_PORT:-5173}:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/web
+      - modules:/web/node_modules
+volumes:
+  storage:
+  modules:
